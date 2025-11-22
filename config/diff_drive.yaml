@@ -1,0 +1,38 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100 # Hz
+
+    # 1. Define the controllers here
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    diff_drive_base_controller:
+      type: diff_drive_controller/DiffDriveController
+
+
+
+diff_drive_base_controller:
+  ros__parameters:
+    # Joint names MUST match your <ros2_control> tag
+    left_wheel_names: ["left_wheel_hinge"]
+    right_wheel_names: ["right_wheel_hinge"]
+
+    wheel_separation: 0.4
+    
+    # NOTE: This is WHEEL RADIUS, not diameter!
+    wheel_radius: 0.1     
+
+    # Odometry settings
+    odom_frame_id: "odom"
+    base_frame_id: "chassis"
+    
+    # Set to true to publish the odom-to-base_link transform
+    enable_odom_tf: true
+
+    # Note: 'command_topic' is not a standard param in ROS2 diff_drive_controller.
+    # It listens to ~/cmd_vel_unstamped by default. Use remappings in launch if needed.
+    # However, keeping these here won't break it, they just might be ignored.
+    
+    publish_rate: 50.0
+    cmd_vel_timeout: 0.5
+    use_stamped_vel: false
