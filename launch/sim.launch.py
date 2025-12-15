@@ -126,6 +126,14 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}]
     )
 
+    obstacle_avoidance = Node(
+        package='autonomous_differential_rob',
+        executable='obstacle_avoidance.py',
+        name='abstacle_avoidance_node',
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
     control_node = Node(
         package='autonomous_differential_rob',
         executable='control.py',
@@ -194,8 +202,23 @@ def generate_launch_description():
     #                "--controller-manager", "/controller_manager"],
     #     output="screen",
     # )
-
-
+    
+    package_name = "autonomous_differential_rob"
+    gz_bridge_params_path = os.path.join(
+        get_package_share_directory(package_name),
+        'config',
+        'gz_bridge.yaml'
+    )
+    # Create a node for the ROS-Gazebo bridge to handle message passing
+    gz_bridge_node = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        arguments=[
+            '--ros-args', '-p',
+            f'config_file:={gz_bridge_params_path}'
+        ],
+        output='screen'
+    )
 
     # Launch Description Assembly
     return LaunchDescription([
@@ -203,9 +226,11 @@ def generate_launch_description():
         robot_state_publisher_node,
         spawn_entity,
         rviz_node,
-        laser_bridge_node,
+        # laser_bridge_node,
         hough_marker,
         control_node,
+        obstacle_avoidance,
+        gz_bridge_node,
         RegisterEventHandler(
             OnProcessExit(target_action=spawn_entity, on_exit=[spawn_jsb])
         ),

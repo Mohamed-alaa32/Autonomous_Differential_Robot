@@ -8,240 +8,256 @@ from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import time
-import math
 
 class LaneDetector:
     def __init__(self):
-        self.lane_width_meters = 0.4
-        # METERS_PER_PIXEL needs calibration based on camera height/angle
-        self.ym_per_pix = 30 / 720  # meters per pixel in y dimension
-        self.xm_per_pix = 3.7 / 700  # meters per pixel in x dimension
+        # Physical parameters
+        self.lane_width_meters = 3.5 # Standard road lane width (adjust for your robot scale, e.g. 0.4 for small bots)
         
-        self.current_fit_left = None
-        self.current_fit_right = None
+        # Camera Calibration (Tune these!)
+        self.ym_per_pix = 30 / 720  
+        self.xm_per_pix = 3.7 / 700 
 
     def preprocess(self, img):
         hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
         lower_white = np.array([0, 200, 0])
         upper_white = np.array([255, 255, 255])
-        white_mask = cv2.inRange(hls, lower_white, upper_white)
-        lower_yellow = np.array([10, 0, 100])
-        upper_yellow = np.array([40, 255, 255])
-        yellow_mask = cv2.inRange(hls, lower_yellow, upper_yellow)
-        combined = cv2.bitwise_or(white_mask, yellow_mask)
-        return combined
+        mask = cv2.inRange(hls, lower_white, upper_white)
+        return mask
 
     def perspective_transform(self, img):
         h, w = img.shape[:2]
-        src = np.float32([
-            [w * 0.4, h * 0.65],
-            [w * 0.6, h * 0.65],
-            [w, h],
-            [0, h]
-        ])
-        dst = np.float32([
-            [w * 0.2, 0],
-            [w * 0.8, 0],
-            [w * 0.8, h],
-            [w * 0.2, h]
-        ])
+        # Trapizoid for "Bird's Eye View"
+        src = np.float32([[w * 0.4, h * 0.65], [w * 0.6, h * 0.65], [w, h], [0, h]])
+        dst = np.float32([[w * 0.2, 0], [w * 0.8, 0], [w * 0.8, h], [w * 0.2, h]])
         M = cv2.getPerspectiveTransform(src, dst)
         Minv = cv2.getPerspectiveTransform(dst, src)
         warped = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR)
         return warped, Minv
 
-    def find_lane_lines(self, binary_warped):
+    def find_peaks(self, histogram, threshold=10, min_dist=100):
+        indices = np.where(histogram > threshold)[0]
+        peaks = []
+        if len(indices) > 0:
+            current_cluster = [indices[0]]
+            for i in range(1, len(indices)):
+                if indices[i] - indices[i-1] < 50:
+                    current_cluster.append(indices[i])
+                else:
+                    peaks.append(current_cluster[np.argmax(histogram[current_cluster])])
+                    current_cluster = [indices[i]]
+            peaks.append(current_cluster[np.argmax(histogram[current_cluster])])
+        
+        # Filter strictly by distance
+        peaks = sorted(peaks)
+        final_peaks = []
+        if peaks:
+            final_peaks.append(peaks[0])
+            for p in peaks[1:]:
+                if p - final_peaks[-1] > min_dist:
+                    final_peaks.append(p)
+        return final_peaks
+
+    def get_fits(self, binary_warped):
         histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
-        midpoint = int(histogram.shape[0] / 2)
-        leftx_base = np.argmax(histogram[:midpoint])
-        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+        peaks = self.find_peaks(histogram)
+        
+        fits = []
+        if len(peaks) < 1: return fits # Need at least one line
 
-        if histogram[leftx_base] < 10 or histogram[rightx_base] < 10:
-            return None, None
-
-        nwindows = 9
-        window_height = int(binary_warped.shape[0] / nwindows)
         nonzero = binary_warped.nonzero()
         nonzeroy = np.array(nonzero[0])
         nonzerox = np.array(nonzero[1])
         
-        leftx_current = leftx_base
-        rightx_current = rightx_base
-        margin = 100
-        minpix = 50
+        for start_x in peaks:
+            lane_inds = []
+            current_x = start_x
+            window_height = int(binary_warped.shape[0] / 9)
+            
+            for window in range(9):
+                win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+                win_y_high = binary_warped.shape[0] - window * window_height
+                win_x_low = current_x - 80
+                win_x_high = current_x + 80
+                
+                good_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                             (nonzerox >= win_x_low) & (nonzerox < win_x_high)).nonzero()[0]
+                lane_inds.append(good_inds)
+                if len(good_inds) > 50:
+                    current_x = int(np.mean(nonzerox[good_inds]))
+            
+            lane_inds = np.concatenate(lane_inds)
+            if len(lane_inds) > 0:
+                try:
+                    fit = np.polyfit(nonzeroy[lane_inds], nonzerox[lane_inds], 2)
+                    fits.append(fit)
+                except: pass
+        return fits
+
+    def generate_path(self, fit_center, height, lookahead_meters=3.0):
+        """Generates trajectory points for 3 meters ahead"""
+        pixels_needed = lookahead_meters / self.ym_per_pix
         
-        left_lane_inds = []
-        right_lane_inds = []
-
-        for window in range(nwindows):
-            win_y_low = binary_warped.shape[0] - (window + 1) * window_height
-            win_y_high = binary_warped.shape[0] - window * window_height
-            win_xleft_low = leftx_current - margin
-            win_xleft_high = leftx_current + margin
-            win_xright_low = rightx_current - margin
-            win_xright_high = rightx_current + margin
-            
-            good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                              (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-            good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                               (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-            
-            left_lane_inds.append(good_left_inds)
-            right_lane_inds.append(good_right_inds)
-            
-            if len(good_left_inds) > minpix:
-                leftx_current = int(np.mean(nonzerox[good_left_inds]))
-            if len(good_right_inds) > minpix:
-                rightx_current = int(np.mean(nonzerox[good_right_inds]))
-
-        left_lane_inds = np.concatenate(left_lane_inds)
-        right_lane_inds = np.concatenate(right_lane_inds)
-
-        try:
-            left_fit = np.polyfit(nonzeroy[left_lane_inds], nonzerox[left_lane_inds], 2)
-            right_fit = np.polyfit(nonzeroy[right_lane_inds], nonzerox[right_lane_inds], 2)
-            self.current_fit_left = left_fit
-            self.current_fit_right = right_fit
-            return left_fit, right_fit
-        except Exception:
-            return self.current_fit_left, self.current_fit_right
-
-    def generate_trajectory_points(self, left_fit, right_fit, height, offset_meters=0):
-        """
-        Generate points limited to 2 METERS ahead of the robot.
-        """
-        # 1. Calculate how many pixels represent 2 meters
-        pixels_needed = 2.0 / self.ym_per_pix
-        
-        # 2. Define Y range
-        # Image Bottom (Robot) = height
-        # 2 Meters away = height - pixels_needed
+        # Generate points from bottom (robot) to 3m ahead
         start_y = height - 1
-        end_y = max(0, height - pixels_needed) # Ensure we don't go off image
+        end_y = max(0, height - pixels_needed)
         
-        # Generate 20 points within this specific 2m range
-        # Note: We generate from Bottom (Near) to Top (Far)
         ploty = np.linspace(start_y, end_y, num=20)
+        fitx = fit_center[0]*ploty**2 + fit_center[1]*ploty + fit_center[2]
         
-        left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
-        right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
-        
-        center_fitx = (left_fitx + right_fitx) / 2
-        
-        offset_pixels = offset_meters / self.xm_per_pix
-        target_fitx = center_fitx + offset_pixels
-        
-        return target_fitx, ploty
+        return fitx, ploty
 
 class LaneNode(Node):
     def __init__(self):
-        super().__init__('lane_keeping_node')
+        super().__init__('lane_trajectory_manager')
         
-        self.declare_parameter('camera_topic', '/front_camera/image_raw')
-        self.declare_parameter('camera_frame_id', 'camera_optical_frame')
+        # Topics
+        self.sub_img = self.create_subscription(Image, '/front_camera/image_raw', self.image_cb, 10)
+        self.sub_trigger = self.create_subscription(PoseStamped, '/lane_switch_trigger', self.trigger_cb, 10)
         
-        topic_name = self.get_parameter('camera_topic').value
-        self.sub_img = self.create_subscription(Image, topic_name, self.image_cb, 10)
         self.pub_path = self.create_publisher(Path, '/lane_trajectory', 10)
-        self.pub_debug_img = self.create_publisher(Image, '/lane_debug', 10)
+        self.pub_debug = self.create_publisher(Image, '/lane_debug', 10)
         
         self.bridge = CvBridge()
         self.detector = LaneDetector()
+        self.latest_image = None
         
-        self.lane_state = 0 
-        self.switch_start_time = 0
-        self.lane_width = 0.4 
+        # === STATE MACHINE ===
+        # 0 = Left Lane, 1 = Right Lane
+        self.target_lane_index = 0 
+        self.last_switch_time = 0
+        self.switch_cooldown = 15.0 # Seconds before allowing another switch
         
         self.create_timer(0.1, self.control_loop)
-        self.switch_timer = self.create_timer(15.0, self.trigger_switch)
+        self.get_logger().info("Lane Manager Started. Default: Left Lane (0). Waiting for Trigger...")
 
-        self.latest_image = None
-        self.get_logger().info("Lane Keeping Node Started - Max Path: 2m, Mode: Sharp Switch")
+    def trigger_cb(self, msg):
+        """Logic: If x < 0.4, Switch Lanes"""
+        current_time = time.time()
+        
+        # Check Cooldown to prevent flickering
+        if (current_time - self.last_switch_time) < self.switch_cooldown:
+            return
 
-    def trigger_switch(self):
-        if self.lane_state == 0:
-            self.get_logger().info("INITIATING SHARP LANE SWITCH RIGHT")
-            self.lane_state = 2 
-            self.switch_start_time = time.time()
-        elif self.lane_state != 0:
-            self.get_logger().info("LANE SWITCH COMPLETE - RESUMING KEEP")
-            self.lane_state = 0
+        if msg.pose.position.x < 0.8:
+            # TOGGLE LANE (0 -> 1, or 1 -> 0)
+            prev_lane = self.target_lane_index
+            self.target_lane_index = 1 - self.target_lane_index
+            
+            self.last_switch_time = current_time
+            self.get_logger().warn(f"TRIGGER RECEIVED (x={msg.pose.position.x:.2f}). Switching Lane: {prev_lane} -> {self.target_lane_index}")
 
     def image_cb(self, msg):
         self.latest_image = msg
 
     def control_loop(self):
-        if self.latest_image is None:
-            return
-
+        if self.latest_image is None: return
         try:
             cv_image = self.bridge.imgmsg_to_cv2(self.latest_image, "bgr8")
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge error: {e}")
-            return
+        except: return
 
+        # 1. Detect Lines
         binary = self.detector.preprocess(cv_image)
         warped, Minv = self.detector.perspective_transform(binary)
-        left_fit, right_fit = self.detector.find_lane_lines(warped)
+        fits = self.detector.get_fits(warped)
         
-        if left_fit is None or right_fit is None:
-            return
+        if len(fits) == 0: return # No lines found
 
-        # --- LOGIC FOR SHARP SWITCHING ---
-        offset = 0.0
-        target_offset = 0.0
+        height, width = warped.shape[:2]
         
-        if self.lane_state == 1: target_offset = -self.lane_width
-        elif self.lane_state == 2: target_offset = self.lane_width
-            
-        if self.lane_state != 0:
-            elapsed = time.time() - self.switch_start_time
-            # Reduced duration for sharper reaction (1.5 seconds total)
-            duration = 1.5 
-            
-            if elapsed < duration:
-                t = elapsed / duration
-                # Smoothstep function (3x^2 - 2x^3) creates an S-curve.
-                # This makes the curvature sharp in the middle of the transition.
-                ratio = t * t * (3 - 2 * t)
-                offset = target_offset * ratio
-            else:
-                offset = target_offset
-        # ----------------------------------
-
-        target_x, target_y = self.detector.generate_trajectory_points(
-            left_fit, right_fit, warped.shape[0], offset_meters=offset
-        )
-
-        path_msg = Path()
-        path_msg.header = self.latest_image.header
-        path_msg.header.frame_id = "front_camera_link" 
+        # 2. Determine "Real" Lanes from Lines
+        # A "Lane" is the space between two fit lines.
+        # We need to map detected lines to our abstract "Lane 0" and "Lane 1" concept.
         
-        for x_pix, y_pix in zip(target_x, target_y):
-            img_h, img_w = warped.shape
-            
-            # Coordinates: Y pixel is Forward (X metric), X pixel is Lateral (Y metric)
-            metric_x = (img_h - y_pix) * self.detector.ym_per_pix
-            metric_y = (img_w/2 - x_pix) * self.detector.xm_per_pix
-            
-            pose = PoseStamped()
-            pose.header = path_msg.header
-            pose.pose.position.x = float(metric_x)
-            pose.pose.position.y = float(metric_y) 
-            pose.pose.position.z = 0.0 
-            pose.pose.orientation.w = 1.0 
-            
-            path_msg.poses.append(pose)
-
-        self.pub_path.publish(path_msg)
+        # Heuristic: Calculate x-position of all lines at the bottom of image
+        bottom_x_positions = []
+        for fit in fits:
+            x_val = fit[0]*(height-1)**2 + fit[1]*(height-1) + fit[2]
+            bottom_x_positions.append(x_val)
         
-        for i in range(len(target_x)):
-            # Draw visual feedback
-            if 0 <= int(target_x[i]) < warped.shape[1] and 0 <= int(target_y[i]) < warped.shape[0]:
-                cv2.circle(warped, (int(target_x[i]), int(target_y[i])), 5, (150), -1)
+        # Sort fits by their position from Left to Right
+        sorted_indices = np.argsort(bottom_x_positions)
+        sorted_fits = [fits[i] for i in sorted_indices]
+        
+        # 3. Select Target Path
+        target_poly_center = None
+        
+        # Case A: We see 3 lines (Perfect visibility of both lanes)
+        if len(sorted_fits) >= 3:
+            if self.target_lane_index == 0: # Target Left
+                left_line = sorted_fits[0]
+                right_line = sorted_fits[1]
+            else: # Target Right
+                left_line = sorted_fits[1]
+                right_line = sorted_fits[2]
+                
+            # Average to find center
+            target_poly_center = (left_line + right_line) / 2.0
+
+        # Case B: We see 2 lines (Only 1 Lane visible)
+        elif len(sorted_fits) == 2:
+            # Is this the left lane or right lane?
+            lane_center_x = (bottom_x_positions[sorted_indices[0]] + bottom_x_positions[sorted_indices[1]]) / 2
             
-        debug_msg = self.bridge.cv2_to_imgmsg(warped, "mono8")
-        self.pub_debug_img.publish(debug_msg)
+            is_left_visual_lane = lane_center_x < (width / 2)
+            
+            detected_poly_center = (sorted_fits[0] + sorted_fits[1]) / 2.0
+            
+            if self.target_lane_index == 0: # WE WANT LEFT
+                if is_left_visual_lane:
+                    target_poly_center = detected_poly_center # We have it
+                else:
+                    # We see Right, but want Left -> Generate Virtual Left Lane
+                    # Subtract lane width (in pixels)
+                    pixel_offset = self.detector.lane_width_meters / self.detector.xm_per_pix
+                    target_poly_center = detected_poly_center.copy()
+                    target_poly_center[2] -= pixel_offset # Shift Left
+                    
+            else: # WE WANT RIGHT
+                if not is_left_visual_lane:
+                    target_poly_center = detected_poly_center # We have it
+                else:
+                    # We see Left, but want Right -> Generate Virtual Right Lane
+                    pixel_offset = self.detector.lane_width_meters / self.detector.xm_per_pix
+                    target_poly_center = detected_poly_center.copy()
+                    target_poly_center[2] += pixel_offset # Shift Right
+
+        # Case C: 1 Line (Guess work, usually assume current lane center offset)
+        else:
+             target_poly_center = sorted_fits[0].copy() # Fallback to tracking the line itself
+             target_poly_center[2] += (self.detector.lane_width_meters / self.detector.xm_per_pix) / 2 # Offset to center
+
+        # 4. Generate & Publish Path (3 Meters Ahead)
+        if target_poly_center is not None:
+            tx, ty = self.detector.generate_path(target_poly_center, height, lookahead_meters=3.0)
+            
+            path_msg = Path()
+            path_msg.header = self.latest_image.header
+            path_msg.header.frame_id = "front_camera_link"
+            
+            for i in range(len(tx)):
+                # Convert Pixels to Meters for ROS
+                metric_x = (height - ty[i]) * self.detector.ym_per_pix # Forward
+                metric_y = (width/2 - tx[i]) * self.detector.xm_per_pix # Lateral
+                
+                pose = PoseStamped()
+                pose.pose.position.x = float(metric_x)
+                pose.pose.position.y = float(metric_y)
+                path_msg.poses.append(pose)
+            
+            self.pub_path.publish(path_msg)
+            
+            # --- DEBUG VISUALIZATION ---
+            # Draw Target Lane in GREEN
+            debug_img = cv_image.copy()
+            pts = np.column_stack((tx, ty)).astype(np.int32)
+            cv2.polylines(debug_img, [pts], False, (0, 255, 0), 5)
+            
+            # Text Status
+            status = f"Mode: {'RIGHT' if self.target_lane_index else 'LEFT'} Lane"
+            cv2.putText(debug_img, status, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            
+            self.pub_debug.publish(self.bridge.cv2_to_imgmsg(debug_img, "bgr8"))
 
 def main(args=None):
     rclpy.init(args=args)

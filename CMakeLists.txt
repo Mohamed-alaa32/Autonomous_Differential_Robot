@@ -36,6 +36,7 @@ install(PROGRAMS
   scripts/hough.py
   scripts/lane_keeping.py
   scripts/control.py
+  scripts/obstacle_avoidance.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
