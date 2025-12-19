@@ -14,17 +14,17 @@ class LaneDetector:
     def __init__(self):
         # === TUNING SECTION ===
         
-        # 1. Lane Width: Match this to your simulation
+        # 1. Lane Width: Match this to your simulation (e.g., 0.5 or 0.6)
         self.lane_width_meters = 0.4  
         
         # 2. Manual Bias: Force the path left or right.
-        # Positive (+) shifts path LEFT 
-        # Negative (-) shifts path RIGHT
+        # Positive (+) shifts path LEFT (fixes robot driving too far Right)
+        # Negative (-) shifts path RIGHT (fixes robot driving too far Left)
         self.manual_bias = 0.00 
         
         # 3. Calibration
         self.ym_per_pix = 30 / 720  
-        self.xm_per_pix = 5.0 / 700 
+        self.xm_per_pix = 2.7 / 700 
 
     def preprocess(self, img):
         hls = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
@@ -51,7 +51,6 @@ class LaneDetector:
 
     def perspective_transform(self, img):
         h, w = img.shape[:2]
-        # Adjust these if your camera angle changes!
         src = np.float32([[w * 0.4, h * 0.65], [w * 0.6, h * 0.65], [w, h], [0, h]])
         dst = np.float32([[w * 0.2, 0], [w * 0.8, 0], [w * 0.8, h], [w * 0.2, h]])
         M = cv2.getPerspectiveTransform(src, dst)
@@ -59,6 +58,7 @@ class LaneDetector:
         warped = cv2.warpPerspective(img, M, (w, h), flags=cv2.INTER_LINEAR)
         return warped, Minv
 
+    # --- RESTORED METHOD ---
     def find_peaks(self, histogram, threshold=10, min_dist=100):
         indices = np.where(histogram > threshold)[0]
         peaks = []
@@ -81,6 +81,7 @@ class LaneDetector:
                     final_peaks.append(p)
         return final_peaks
 
+    # --- UPDATED ROBUST FITTING ---
     def get_fits(self, binary_warped):
         histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
         peaks = self.find_peaks(histogram)
@@ -111,9 +112,11 @@ class LaneDetector:
             
             lane_inds = np.concatenate(lane_inds)
             
+            # Robust Logic: Only fit if we have enough pixels
             if len(lane_inds) > 100:
                 y_span = np.max(nonzeroy[lane_inds]) - np.min(nonzeroy[lane_inds])
                 try:
+                    # If line is short (<150px), use linear fit (degree 1) to avoid wild curves
                     if y_span < 150:
                         linear_fit = np.polyfit(nonzeroy[lane_inds], nonzerox[lane_inds], 1)
                         fit = np.array([0, linear_fit[0], linear_fit[1]])
@@ -137,6 +140,7 @@ class LaneNode(Node):
         super().__init__('lane_trajectory_manager')
         
         self.sub_img = self.create_subscription(Image, '/front_camera/image_raw', self.image_cb, 10)
+        self.sub_trigger = self.create_subscription(PoseStamped, '/obstacle/blue_box_pose', self.trigger_cb, 10)
         
         self.pub_path = self.create_publisher(Path, '/lane_trajectory', 10)
         self.pub_debug = self.create_publisher(Image, '/lane_debug', 10)
@@ -146,9 +150,22 @@ class LaneNode(Node):
         self.detector = LaneDetector()
         self.latest_image = None
         
+        self.target_lane_index = 1 
+        self.last_switch_time = 0
+        self.switch_cooldown = 6.0 
         self.finish_line_triggered = False
+
         self.create_timer(0.01, self.control_loop)
-        self.get_logger().info("Single Lane Manager Started.")
+        self.get_logger().info("Lane Manager Started.")
+
+    def trigger_cb(self, msg:PoseStamped):
+        current_time = time.time()
+        if (current_time - self.last_switch_time) < self.switch_cooldown:
+            return
+        if msg.pose.position.x < 1.6 and abs(msg.pose.position.y) < 0.2:
+            self.target_lane_index = 1 - self.target_lane_index
+            self.last_switch_time = current_time
+            self.get_logger().info("Switching Lane!")
 
     def image_cb(self, msg):
         self.latest_image = msg
@@ -176,17 +193,11 @@ class LaneNode(Node):
         height, width = warped.shape[:2]
         debug_img = cv_image.copy()
 
-        # Add Visual Alert for Finish Line
-        if is_finish:
-             cv2.putText(debug_img, "FINISH LINE!", (int(width/2) - 150, int(height/2)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
-
         if len(fits) == 0:
             self.pub_debug.publish(self.bridge.cv2_to_imgmsg(debug_img, "bgr8"))
-            self.get_logger().warn("Mode: 0 Lines - Lost")
             return 
 
-        # 2. Logic: Single Lane Centering
+        # 2. Logic: Ensure Equidistance
         bottom_x_positions = []
         for fit in fits:
             x_val = fit[0]*(height-1)**2 + fit[1]*(height-1) + fit[2]
@@ -197,32 +208,42 @@ class LaneNode(Node):
         
         target_poly_center = None
         
-        # === SIMPLIFIED SINGLE LANE LOGIC ===
+        # --- Strict Logic ---
         if len(sorted_fits) >= 2:
-            # Case A: We see at least 2 lines. 
-            # We assume the two "most prominent" lines are the Left and Right boundaries.
-            # We target the center of these two lines.
-            self.get_logger().info(f"Mode: 2 Lines (Gap: {abs(bottom_x_positions[0] - bottom_x_positions[1]):.1f}px)")
-            left_line = sorted_fits[0]
-            right_line = sorted_fits[1]
-            target_poly_center = (left_line + right_line) / 2.0
-
-        elif len(sorted_fits) == 1:
-            # Case B: We only see 1 line.
-            # We need to guess if it's the Left Line or the Right Line.
-            line_x = bottom_x_positions[0]
-            detected_line = sorted_fits[0]
-            
-            # Calculate pixel offset based on lane width
-            shift_px = (self.detector.lane_width_meters / self.detector.xm_per_pix) / 2.0
-            
-            target_poly_center = detected_line.copy()
-            self.get_logger().info("Mode: 1 Line (Using Width Guess)")
-            # Heuristic: If the line is on the left half of the image, assume it's the Left Line.
-            if line_x < (width / 2):
-                target_poly_center[2] += shift_px # Shift Target Right
+            lane_center_x = (bottom_x_positions[sorted_indices[0]] + bottom_x_positions[sorted_indices[1]]) / 2
+            is_left_visual_lane = lane_center_x < (width / 2)
+            if len(sorted_fits) >= 3:
+                self.get_logger().info(f"Mode: 3 Lines (Gap: {abs(bottom_x_positions[0] - bottom_x_positions[1]):.1f}px)")
+                if self.target_lane_index == 0:
+                     target_poly_center = (sorted_fits[0] + sorted_fits[1]) / 2.0
+                else:
+                     target_poly_center = (sorted_fits[1] + sorted_fits[2]) / 2.0
             else:
-                target_poly_center[2] -= shift_px # Shift Target Left
+                self.get_logger().info(f"Mode: 2 Lines (Gap: {abs(bottom_x_positions[0] - bottom_x_positions[1]):.1f}px)")
+                detected_center = (sorted_fits[0] + sorted_fits[1]) / 2.0
+                if self.target_lane_index == 0: 
+                    if is_left_visual_lane: target_poly_center = detected_center 
+                    else:
+                        shift_px = self.detector.lane_width_meters / self.detector.xm_per_pix
+                        target_poly_center = detected_center.copy()
+                        target_poly_center[2] -= shift_px
+                else: 
+                    if not is_left_visual_lane: target_poly_center = detected_center 
+                    else:
+                        shift_px = self.detector.lane_width_meters / self.detector.xm_per_pix
+                        target_poly_center = detected_center.copy()
+                        target_poly_center[2] += shift_px
+
+        else:
+            # 1 Line Visible
+            self.get_logger().info("Mode: 1 Line (Using Width Guess)")
+            target_poly_center = sorted_fits[0].copy()
+            shift_px = (self.detector.lane_width_meters / self.detector.xm_per_pix) / 2
+            line_x = bottom_x_positions[0]
+            if line_x < width/2:
+                target_poly_center[2] += shift_px 
+            else:
+                target_poly_center[2] -= shift_px 
 
         # 4. Generate Path
         if target_poly_center is not None:
@@ -235,7 +256,7 @@ class LaneNode(Node):
             for i in range(len(tx)):
                 metric_x = (height - ty[i]) * self.detector.ym_per_pix 
                 
-                # Apply Manual Bias
+                # --- APPLY MANUAL BIAS HERE ---
                 raw_metric_y = (width/2 - tx[i]) * self.detector.xm_per_pix
                 final_metric_y = raw_metric_y + self.detector.manual_bias
                 
@@ -246,13 +267,16 @@ class LaneNode(Node):
             
             self.pub_path.publish(path_msg)
 
-            # Debug Visualization
+            # --- DEBUG VISUALIZATION ---
             cv2.line(debug_img, (int(width/2), 0), (int(width/2), height), (255, 0, 0), 2)
             bias_px = self.detector.manual_bias / self.detector.xm_per_pix
             visual_tx = tx - bias_px 
             pts = np.column_stack((visual_tx, ty)).astype(np.int32)
             cv2.polylines(debug_img, [pts], False, (0, 255, 0), 4)
-            
+            if self.finish_line_triggered:
+                cv2.putText(debug_img, "FINISH LINE!", (int(width/2) - 150, int(height/2)), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+            # status = f"Bias: {self.detector.manual_bias:.2f}m"
+            # cv2.putText(debug_img, status, (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             self.pub_debug.publish(self.bridge.cv2_to_imgmsg(debug_img, "bgr8"))
 
 def main(args=None):

@@ -26,7 +26,7 @@ def generate_launch_description():
     pkg_share = get_package_share_directory('autonomous_differential_rob')
 
     # --- 2. BUILD THE FULL PATH TO YOUR SDF FILE ---
-    world_file_path = os.path.join(pkg_share, 'worlds', 'world.sdf')
+    world_file_path = os.path.join(pkg_share, 'worlds', 'world_2.sdf')
 
     # --- 3. PASS THE FULL PATH TO GAZEBO ---
     gazebo = IncludeLaunchDescription(
@@ -58,7 +58,7 @@ def generate_launch_description():
     spawn_entity = Node(
         package='ros_gz_sim',
         executable='create',
-        arguments=['-topic', 'robot_description', '-name', 'robot', '-x', '-1.0','-y', '0.0','-z', '0.5'],
+        arguments=['-topic', 'robot_description', '-name', 'robot', '-x', '0.0','-y', '-0.5','-z', '0.5', '-Y', '-0.5707'],
         output='screen'
     )
 
@@ -120,7 +120,7 @@ def generate_launch_description():
 
     hough_marker = Node(
         package='autonomous_differential_rob',
-        executable='lane_keeping.py',
+        executable='lane_keeping_switching.py',
         name='line_follower_node',
         output='screen',
         parameters=[{'use_sim_time': True}]
@@ -231,10 +231,10 @@ def generate_launch_description():
         control_node,
         obstacle_avoidance,
         gz_bridge_node,
-        RegisterEventHandler(
-            OnProcessExit(target_action=spawn_entity, on_exit=[spawn_jsb])
-        ),
-        RegisterEventHandler(
-            OnProcessExit(target_action=spawn_jsb, on_exit=[spawn_diff_drive])
-        ),
+        # RegisterEventHandler(
+        #     OnProcessExit(target_action=spawn_entity, on_exit=[spawn_diff_drive])
+        # ),
+        # RegisterEventHandler(
+        #     OnProcessExit(target_action=spawn_jsb, on_exit=[spawn_diff_drive])
+        # ),
     ])

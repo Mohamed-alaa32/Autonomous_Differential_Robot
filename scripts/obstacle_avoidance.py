@@ -9,15 +9,16 @@ from scipy.spatial.transform import Rotation as R
 
 from sensor_msgs.msg import Image, CameraInfo
 from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PoseStamped  # <--- NEW IMPORT
 
 class BlueBoxDetector(Node):
     def __init__(self):
         super().__init__('blue_box_detector')
 
         # === Configuration ===
-        self.BOX_REAL_SIZE = 0.4  # Meters (40cm)
-        self.CAMERA_HEIGHT = 0.2  # Height of camera from floor (meters)
-        self.CAMERA_PITCH = 0.0   # Radians (0 if looking straight forward)
+        self.BOX_REAL_SIZE = 0.3  
+        self.CAMERA_HEIGHT = 0.2  
+        self.CAMERA_PITCH = 0.0   
 
         self.blue_lower = np.array([100, 150, 50])
         self.blue_upper = np.array([140, 255, 255])
@@ -27,6 +28,9 @@ class BlueBoxDetector(Node):
         
         self.marker_pub = self.create_publisher(Marker, '/obstacle/blue_box_marker', 10)
         self.debug_pub = self.create_publisher(Image, '/obstacle/debug_view', 10)
+        
+        # --- NEW PUBLISHER ---
+        self.pose_pub = self.create_publisher(PoseStamped, '/obstacle/blue_box_pose', 10)
 
         self.bridge = CvBridge()
         self.fx = 600.0
@@ -58,59 +62,69 @@ class BlueBoxDetector(Node):
             largest_contour = max(contours, key=cv2.contourArea)
             
             if cv2.contourArea(largest_contour) > 500:
-                # 1. Get Rotated Rectangle (Handles the "not facing perfectly" issue)
-                # rect returns ((center_x, center_y), (width, height), angle)
                 rect = cv2.minAreaRect(largest_contour)
                 box_points = cv2.boxPoints(rect)
-                box_points = np.int0(box_points)
+                
+                # --- FIX: Replace np.int0 with np.int32 ---
+                box_points = np.int32(box_points) 
 
-                # 2. Find the "Bottom-Most" Point (The point touching the ground closest to us)
-                # We look for the point with the highest Y pixel value
                 lowest_point = max(box_points, key=lambda p: p[1])
                 bottom_pixel_y = lowest_point[1]
                 
-                # 3. Calculate Distance to that Front Contact Point
                 alpha = math.atan2(bottom_pixel_y - self.cy, self.fy)
                 total_angle = self.CAMERA_PITCH + alpha
                 
-                # Protect against division by zero (horizon)
                 if total_angle < 0.01: total_angle = 0.01 
                 
                 dist_to_front = self.CAMERA_HEIGHT / math.tan(total_angle)
-
-                # 4. Apply Depth Offset
-                # We detected the front face/corner. The center is 'Size/2' further back.
-                # Note: This is a simplification. For 45-degree rotation, the offset differs slightly,
-                # but Size/2 is a safe robust average for obstacle avoidance.
                 final_z = dist_to_front + (self.BOX_REAL_SIZE / 2.0)
 
-                # 5. Calculate X Position
-                # Use the visual center of the rotated box for X
                 center_x_px = rect[0][0]
                 real_x = (center_x_px - self.cx) * final_z / self.fx
                 
-                # 6. Calculate Orientation (Yaw)
-                # OpenCV angle is usually -90 to 0. We convert this to radians.
                 angle_deg = rect[2]
                 if rect[1][0] < rect[1][1]: 
-                    angle_deg += 90 # Adjust based on which side is "width"
-                
-                # Convert to Radians. Note: Image rotation is around Z-axis in image plane, 
-                # which maps to Y-axis rotation in the Optical Frame.
+                    angle_deg += 90 
                 yaw = math.radians(angle_deg)
 
-                # 7. Visualization
+                # --- 1. Publish Marker ---
                 self.publish_marker(msg.header, real_x, final_z, yaw)
                 
-                # Draw rotated box on debug image
+                # --- 2. Publish PoseStamped ---
+                self.publish_pose(msg.header, real_x, final_z, yaw)
+                
                 cv2.drawContours(cv_image, [box_points], 0, (0, 0, 255), 2)
-                cv2.circle(cv_image, tuple(lowest_point), 5, (0, 255, 0), -1) # Green dot at bottom contact
+                cv2.circle(cv_image, tuple(lowest_point), 5, (0, 255, 0), -1) 
                 cv2.putText(cv_image, f"{final_z:.2f}m", (lowest_point[0], lowest_point[1]), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
 
         debug_msg = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
         debug_msg.header = msg.header
         self.debug_pub.publish(debug_msg)
+
+    def publish_pose(self, header, x, z, yaw):
+        """
+        Publishes the PoseStamped of the box center.
+        Note: Coordinates are in Optical Frame (Z=Forward, X=Right, Y=Down)
+        """
+        pose_msg = PoseStamped()
+        pose_msg.header = header
+        pose_msg.header.frame_id = "front_camera_link"
+        
+        # Position
+        pose_msg.pose.position.x = z  # Forward distance
+        pose_msg.pose.position.y = -(x) # Lateral (ROS Y is usually Left, Optical X is Right -> flip sign)
+        pose_msg.pose.position.z = 0.0 # On the floor (relative to robot base usually, but here relative to camera frame)
+        
+        # Orientation
+        # Assuming simple yaw rotation around vertical axis
+        q = R.from_euler('z', yaw, degrees=False).as_quat()
+        pose_msg.pose.orientation.x = q[0]
+        pose_msg.pose.orientation.y = q[1]
+        pose_msg.pose.orientation.z = q[2]
+        pose_msg.pose.orientation.w = q[3]
+
+        self.pose_pub.publish(pose_msg)
 
     def publish_marker(self, header, x, z, yaw):
         marker = Marker()
@@ -121,14 +135,12 @@ class BlueBoxDetector(Node):
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
         
+        # Rviz Visualization Coordinates
         marker.pose.position.x = z
-        # Fixed Y: Camera Height (Ground) - Half Box Height
-        marker.pose.position.y = -(self.CAMERA_HEIGHT - (self.BOX_REAL_SIZE / 2.0))
-        marker.pose.position.z = x
+        marker.pose.position.y = -x # Negate because Camera Link Y is LEFT, Image X is RIGHT
+        marker.pose.position.z = 0.0 # Floor level roughly relative to camera frame if we ignore height offset
         
-        # Create Quaternion for Rotation
-        # In Optical Frame (X-Right, Y-Down, Z-Forward), "Yaw" is rotation around Y-axis.
-        q = R.from_euler('y', yaw, degrees=False).as_quat()
+        q = R.from_euler('z', yaw, degrees=False).as_quat()
         
         marker.pose.orientation.x = q[0]
         marker.pose.orientation.y = q[1]

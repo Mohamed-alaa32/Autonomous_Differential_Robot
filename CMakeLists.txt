@@ -37,6 +37,7 @@ install(PROGRAMS
   scripts/lane_keeping.py
   scripts/control.py
   scripts/obstacle_avoidance.py
+  scripts/lane_keeping_switching.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
